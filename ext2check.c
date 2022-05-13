@@ -6,7 +6,7 @@
 #include<sys/types.h>
 #include<sys/stat.h>
 #include<string.h>
-#include"ext2_reserv.h"
+#include<ext2fs/ext2_fs.h>
 
 #define block_size (1024 << super.s_log_block_size)
 #define BASE_OFFSET 1024
