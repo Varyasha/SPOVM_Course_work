@@ -1,13 +1,11 @@
-#include<stdio.h>
-#include<fcntl.h>
-#include<unistd.h>
-#include<stdlib.h>
 #include<linux/fs.h>
 #include<sys/types.h>
 #include<sys/stat.h>
 #include<string.h>
 #include<ext2fs/ext2_fs.h>
 #include<errno.h>
+
+#include"queue.h"
 
 #define block_size (1024 << super.s_log_block_size)
 #define BASE_OFFSET 1024
@@ -18,60 +16,17 @@
 #define EXT2_TIND_BLOCK     (EXT2_DIND_BLOCK + 1)
 #define EXT2_N_BLOCKS     (EXT2_TIND_BLOCK + 1)
 
-struct queue_error_inodes{
-    int in;
-    struct queue_error_inodes* next;
-};
-void push_error_inode(struct queue_error_inodes** h, struct queue_error_inodes** t, int in) {
-    struct queue_error_inodes* temp;
-    if (!(temp = (struct queue_error_inodes*)calloc(1, sizeof(struct queue_error_inodes)))) {
-        printf("Memory is not allocated\n");
-        return;
-    }
-    temp->next = NULL;
-    temp->in = in;
-    if (!(*h))
-        *t=*h=temp;
-    else {
-        (*t)->next=temp;
-        *t = temp;
-    }
-}
-void print_error_inode(struct queue_error_inodes* h){
-    if (!h)
-    {
-        puts("Queue is empty\n");
-        return;
-    }
-    do
-    {
-        printf("%d ", h->in);
-        h = h->next;
-    } while (h);
-    return;
-}
 
 int sd;
 struct ext2_super_block super;
-//struct ext2_group_desc desc;
-//struct ext2_inode inode;
+typedef struct ext2_inode INODE;
 
-char** actual_inode_bitmap;
-int *occupied_blocks = 0;//1, если блок уже имеет ссылку на такой блок. 0 в противном случае
+char* actual_inode_bitmap;
+int* occupied_blocks;//1, если блок уже имеет ссылку на такой блок. 0 в противном случае
 int group_count;
-int actual_inode_count;
 int is_clean = 1;
-struct queue_error_inodes *h_occup = NULL, *t_occup = NULL;//очередь хранения поврежденных инодов с ссылками на один и тот же блок данных
-struct queue_error_inodes *h_perm = NULL, *t_perm = NULL;//очередь хранения поврежденных инодов без разрешений
-struct queue_error_inodes *h_lost = NULL, *t_lost = NULL;//очередь хранения поврежденных инодов без ссылок из коталогов
-struct queue_error_inodes *h_freeButOccup = NULL, *t_freeButOccup = NULL;//очередь хранения поврежденных инодов, отмеченных в битмапе инодов как занятые, но на самом деле свободные
-struct queue_error_inodes *h_occupButFree = NULL, *t_occupButFree = NULL;//очередь хранения поврежденных инодов, отмеченных в битмапе инодов как свободные, но на самом деле занятые
 
 void free_memory() {
-    int i;
-    for (i = 0; i < group_count; i++) {
-        free(actual_inode_bitmap[i]);
-    }
     free(actual_inode_bitmap);
     free(occupied_blocks);
 }
@@ -132,54 +87,46 @@ int inode_allocated(uint32_t inode_num, char* inode_bitmap) {
     else
         return 0;
 }
-void get_inode(int i_num, struct ext2_inode *in, __u32 inode_table, __u32 inodes_per_group, __u32 inode_size){
-    int index = (i_num - 1) % inodes_per_group;
 
-    lseek(sd, (__u64)(inode_table) * block_size + index * inode_size, SEEK_SET);
-    if(!read(sd, in, inode_size)){
-        printf("Error read inode\n");
-        exit(-1);
-    }
-}
 void get_inode_bitmap(struct ext2_group_desc _desc, int group){
     lseek(sd,  block_size * _desc.bg_inode_bitmap, SEEK_SET);//сдвигаюсь на позицию блока с битмапой
     int	size = super.s_inodes_per_group / 8;
     ssize_t	actual;
-    actual = read(sd, actual_inode_bitmap[group], size);
-
+    actual = read(sd, actual_inode_bitmap, size);
     if (actual == -1) {
-        printf("Ошибка чтиния битмапы инодов (-1) \n");
+        printf("Error reading the inode bitmap (-1) \n");
+        exit(-5);
     }
     if (actual != size) {
-        printf("Ошибка чтиния битмапы инодов (size)\n");
+        printf("Error reading the inode bitmap (size)\n");
+        exit(-5);
     }
 }
-void checkPermissions(struct ext2_inode _inode, int i) {
-    fprintf(stderr, "\nПоиск inode с отсутствием разрешений....\n");
-    if(_inode.i_mode == 0) {
-        printf("Inode %d не имеет разрешений. \n", i);
+void checkInodeMode(__u16 i_mode, int i) {
+    //fprintf(stderr, "\nПоиск inode с отсутствием разрешений....\n");
+    if(i_mode == 0) {
+        printf("The inode %d has the wrong format of the described file and the access rights. \n", i);
         push_error_inode(&h_perm, &t_perm, i);
         is_clean = 0;
     }
 }
-void checkLostInodes(struct ext2_inode _inode, int i) {
-    if(_inode.i_links_count == 0) {
-        printf("Ни одина из записей каталогов не ссылается на inode %d\n", i);
+void checkLostInodes(__u16 i_links_count, int i) {
+    if(i_links_count == 0) {
+        printf("None of the directory entries refer to inode %d\n", i);
         push_error_inode(&h_lost, &t_lost, i);
         is_clean = 0;
     }
-
 }
 void checkMultiLink(__u32* i_block, int i){
     // проверка прямых ссылок
     for(int j = 0; j < 12; j++) {//адрес инф. блока (прямая ссылка) 0 - 11
         unsigned int block = *(i_block+j);
         if(block>super.s_blocks_count){
-            printf("Недопустимый адресуемый блок %d\n", block);
+            printf("Invalid address block %d\n", block);
             is_clean = 0;
         }
         if(occupied_blocks[block]) {
-            printf("В таблице блоков inode-а несколько ссылок на одинаковый блок %d.\n", i);
+            printf("Several references to the same block were found in the array of addresses of blocks with data in the inode %d.\n", i);
             push_error_inode(&h_occup, &t_occup, i);
             is_clean = 0;
         }
@@ -196,7 +143,7 @@ void checkMultiLink(__u32* i_block, int i){
     for(int j = 0; j < block_size >> 2; j++) {
         int block = indirect_blocks[j];
         if(occupied_blocks[block]) {
-            printf("Ошибка косвенной ссылки на блок с данными файла в иноде %d.\n", i);
+            printf("Error indirectly linking to a block with file data in the inode %d.\n", i);
             push_error_inode(&h_occup, &t_occup, i);
             is_clean = 0;
         }
@@ -216,7 +163,7 @@ void checkMultiLink(__u32* i_block, int i){
         for(int j = 0; j < block_size >> 2; j++) {
             int block = indirect_blocks[j];
             if(occupied_blocks[block]) {
-                printf("Ошибка двойной косвенной ссылки на блок с данными файла в иноде %d.\n", i);
+                printf("Error of double indirect reference to the block with file data in the inode %d.\n", i);
                 push_error_inode(&h_occup, &t_occup, i);
                 is_clean = 0;
             }
@@ -241,7 +188,7 @@ void checkMultiLink(__u32* i_block, int i){
             for(int j = 0; j < block_size >> 2; j++) {
                 int block = indirect_blocks[j];
                 if(occupied_blocks[block]) {
-                    printf("Ошибка тройной косвенной ссылки на блок с данными файла в иноде %d.\n", i);
+                    printf("Error of triple indirect reference to the block with file data in the inode %d.\n", i);
                     push_error_inode(&h_occup, &t_occup, i);
                     is_clean = 0;
                 }
@@ -250,113 +197,144 @@ void checkMultiLink(__u32* i_block, int i){
         }
     }
 
+}//valgrind запустить программу
+
+void get_inode(int i_num, char* buf, __u32 inode_table){
+    int index = (i_num - 1) % super.s_inodes_per_group;
+    int offset = (inode_table) * block_size + index * super.s_inode_size;
+    lseek(sd, offset, SEEK_SET);
+    if(!read(sd, buf, super.s_inode_size)){
+        printf("Error read inode\n");
+        exit(-1);
+    }
 }
+
 void movingThroughInodes(int group) {
-    struct ext2_inode inode;
+    INODE *ip;
+    char buf[256];
     struct ext2_group_desc desc;
     int size = super.s_blocks_per_group * group_count;
-    if(!(occupied_blocks = (int*)calloc(size, sizeof (int)))) {
-        printf("Memory allocation error\n");
-    }
+    //group = 9;
     lseek(sd, block_size +  group * sizeof(desc), SEEK_SET);
     memset(&desc, 0, sizeof(struct ext2_group_desc));
     read(sd, &desc, sizeof(desc));
-    fprintf(stderr, "\nПроверка ссылок на одинаковые блоки....\n");
+    //fprintf(stderr, "\nПроверка ссылок на одинаковые блоки.... группа %d\n", group);
     get_inode_bitmap(desc, group);
-    int i = 0;
+    int i;
     if(group == 0) {
         i = super.s_first_ino;
     }
     else {
         i = group * super.s_inodes_per_group + 1; //первый инод группы
     }
-    for( ; i <= super.s_inodes_per_group * (group + 1); i++) {
-        if(inode_allocated(i, actual_inode_bitmap[group]) == 1){
-            printf("Inode %d размещен на биткарте инодов\n", i);
-            get_inode(i, &inode, desc.bg_inode_table, super.s_inodes_per_group, super.s_inode_size);
-            if(inode.i_size == 0){
-                printf("Inode %d помечен как занятый, но на самом деле свободен\n", i);
+    int limit = super.s_inodes_per_group * (group+1);
+    for( ; i <= limit; i++) {
+        if(inode_allocated(i, actual_inode_bitmap) == 1){
+            //printf("Inode %d размещен на биткарте инодов\n", i);
+            get_inode(i, buf, desc.bg_inode_table);
+            ip = (INODE*)buf;
+            if(ip->i_size == 0){
+                //printf("Inode %d помечен как занятый, но на самом деле свободен\n", i);
                 push_error_inode(&h_occupButFree, &t_occupButFree, i);
+                is_clean = 0;
             }
             else {
-                checkMultiLink(inode.i_block, i);
-                checkPermissions(inode, i);
-                checkLostInodes(inode, i);
+                checkMultiLink(ip->i_block, i);
+                checkInodeMode(ip->i_mode, i);
+                checkLostInodes(ip->i_links_count, i);
             }
         }
-        else{
-            get_inode(i, &inode, desc.bg_inode_table, super.s_inodes_per_group, super.s_inode_size);
-            if(inode.i_size > 0){
-                printf("Inode %d помечен как свободный, но на самом деле занят\n", i);
+        else {
+            get_inode(i, buf, desc.bg_inode_table);
+            ip = (INODE*)buf;
+
+            if (ip->i_size > 0) {
+                //printf("Inode %d помечен как свободный, но на самом деле занят\n", i);
                 push_error_inode(&h_freeButOccup, &t_freeButOccup, i);
+                is_clean = 0;
             }
 
         }
     }
-
 }
 
 void blockMovement(){
-    //struct ext2_super_block super;
-    //struct ext2_group_desc desc;
     lseek(sd, BASE_OFFSET, SEEK_SET);
     read(sd, &super, sizeof(super));
-    //lseek(sd, BASE_OFFSET + block_size, SEEK_SET);
-    //read(sd, &desc, sizeof(desc));
     group_count = 1 + (super.s_blocks_count-1) / super.s_blocks_per_group;
-    int gp = group_count;
-    actual_inode_bitmap = (char**)malloc(group_count * sizeof(char*));
     int size = super.s_inodes_per_group / 8;
-    int j;
-    for (j = 0; j < group_count; j++) {
-        actual_inode_bitmap[j] = malloc(size);//кол-во инодов в группе / кол-во битов в байте
-    }
 
+    actual_inode_bitmap = calloc(size, sizeof (char));
+
+    if(!(occupied_blocks = (int*)calloc(super.s_blocks_count, sizeof(int)))) {
+        printf("Memory allocation error\n");
+    }
+    printf("\nChecking for references to the same block in the array of addresses of blocks with data in the inode.... \n");
+    printf("Checking inodes for the wrong format of the described file and the access rights.... \n");
+    printf("Checking inodes for directory entries links.... \n");
     for(int i = 0; i < group_count; i++) {
         //printf("\n=== Группа блоков %d ===\n", i);
         movingThroughInodes(i);
     }
 }
 
-int diskAccessCheck(char* path){
-    sd = open(path, O_RDWR);
+int openDisk(char* path){
+    sd = open(path, O_RDONLY);
     if(sd == -1){
+        return 0;
+    }
+    return 1;
+}
+
+int closeDisk(){
+    if (close(sd) < 0){
+        perror("close");
+        return 0;
+    }
+    return 1;
+}
+
+int diskAccessCheck(char* path){
+    if(!openDisk(path)){
         return -1;
     }
     //fprintf(stdout, "\nopen return %d\n", sd);
     fprintf(stdout, "File system type check...\n");
     if(!checkSuperblock(sd)){
-        //fprintf(stdout, "Causes:\n");
-        //fprintf(stdout,"- - - Superblock is not corrected. Magic number error.\n");
         return 0;
     }
-
     return sd;
 }
 
 void printResult(){
     if(is_clean)
-        printf("System is clean\n");
+        printf("\n- - - System is clean\n");
     else{
+        printf("\n- - - System is not clean\n");
         if(h_occup!=NULL){
             printf("\nInodes that refer to the same data blocks: ");
             print_error_inode(h_occup);
+            printf("\n");
         }
         if(h_lost!=NULL){
-            printf("\nLost inodes (not referenced by any directory): ");
+            printf("Lost inodes (not referenced by any directory): ");
             print_error_inode(h_lost);
+            printf("\n");
         }
         if(h_perm!=NULL){
-            printf("\nInodes without permissions: ");
+            printf("Inodes without permissions: ");
             print_error_inode(h_perm);
+            printf("\n");
         }
         if(h_occupButFree!=NULL){
-            printf("\nInodes marked as occupied, but actually free: ");
+            printf("Inodes marked as occupied, but actually free: ");
             print_error_inode(h_occupButFree);
+            printf("\n");
         }
         if(h_freeButOccup!=NULL){
-            printf("\nInodes marked as free, but actually occupied: ");
+            printf("Inodes marked as free, but actually occupied: ");
             print_error_inode(h_freeButOccup);
+            printf("\n");
         }
     }
 }
@@ -364,13 +342,16 @@ void printResult(){
 int main(int argc, char **argv) {
     if(argc<2){
         fprintf(stdout, "The path to the disk with the file system is not specified\n");
+        fprintf(stdout, "\nCorrect format of the utility call:\n");
+        fprintf(stdout, "sudo ./ext2check <path to the disk with the file system>\n");
+        fprintf(stdout, "\nFor example: sudo ./ext2check /dev/sdb1\n");
         //fprintf(stdout, "Путь к диску с файловой системой не указан.\n");
         return 0;
     }
     sd = diskAccessCheck(argv[1]);
     switch(sd){
         case -1:{
-            fprintf(stdout, "Error opening the file.\n");
+            fprintf(stdout, "Error opening the disk. Please run with superuser rights (sudo)\n");
             //fprintf(stdout, "Ошибка открытия файла.\n");
             return -1;
         }break;
@@ -390,9 +371,9 @@ int main(int argc, char **argv) {
     printResult();
     free_memory();
 
-    if (close(sd) < 0){
-        perror("close");
-        return -1;
+    if(!closeDisk()){
+        printf("Error closing the disk.\n");
+        return -3;
     }
     return 0;
 }
